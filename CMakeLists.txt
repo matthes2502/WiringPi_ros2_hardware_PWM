@@ -17,33 +17,33 @@ if(NOT WIRINGPI_LIB)
 endif()
 
 # === Executables bauen ===
-add_executable(my_bosch_bldc src/my_bosch_bldc.cpp)
-add_executable(pump_controller src/pump_controller.cpp)
+add_executable(propeller_controller_node src/propeller_controller.cpp)
+add_executable(pump_controller_node src/pump_controller.cpp)
 
 # Includes
-target_include_directories(my_bosch_bldc PUBLIC
+target_include_directories(propeller_controller_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
 )
-target_include_directories(pump_controller PUBLIC
+target_include_directories(pump_controller_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
 )
 
 # Compiler Features
-target_compile_features(my_bosch_bldc PUBLIC c_std_99 cxx_std_17)
-target_compile_features(pump_controller PUBLIC cxx_std_17)
+target_compile_features(propeller_controller_node PUBLIC c_std_99 cxx_std_17)
+target_compile_features(pump_controller_node PUBLIC cxx_std_17)
 
 # ROS2 Dependencies
-ament_target_dependencies(my_bosch_bldc rclcpp std_msgs)
-ament_target_dependencies(pump_controller rclcpp std_msgs)
+ament_target_dependencies(propeller_controller_node rclcpp std_msgs)
+ament_target_dependencies(pump_controller_node rclcpp std_msgs)
 
 # WiringPi linken
-target_link_libraries(my_bosch_bldc ${WIRINGPI_LIB})
-target_link_libraries(pump_controller ${WIRINGPI_LIB})
+target_link_libraries(propeller_controller_node ${WIRINGPI_LIB})
+target_link_libraries(pump_controller_node ${WIRINGPI_LIB})
 
 # Installation
-install(TARGETS my_bosch_bldc pump_controller
+install(TARGETS propeller_controller_node pump_controller_node
   DESTINATION lib/${PROJECT_NAME})
 
 # Tests (optional)

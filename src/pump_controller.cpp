@@ -1,111 +1,163 @@
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/bool.hpp>
-#include <wiringPi.h>
+#include <std_msgs/msg/float32.hpp>
+#include <cstdlib>
 #include <unistd.h>
-#include <signal.h>
+#include <csignal>
+#include <atomic>
 
-// Global für Signal Handler
-int g_pwm_pin = 1;
+/* README
+- Pump ESC Controller Node
+- to start from terminal
+    --> Start/stop pump with absolute PWM value (1000-2000µs)
+        ros2 topic pub --once /pump/pwm_command std_msgs/msg/Float32 "data: 1500.0"
+*/
 
-void signal_handler(int signum) {
-    printf("\nCtrl+C received - stopping pump safely...\n");
-    pwmWrite(g_pwm_pin, 100);  // 1000µs neutral
-    usleep(500000);
-    pwmWrite(g_pwm_pin, 0);    // PWM off
-    printf("Pump stopped safely\n");
-    exit(0);
-}
-
-class PumpController : public rclcpp::Node {
+class PumpControlNode : public rclcpp::Node
+{
 public:
-    PumpController() : Node("pump_controller"), pwm_pin_(1) {
-        g_pwm_pin = pwm_pin_;  // Für Signal Handler
+    // Configuration constants for Pump
+    static constexpr int GPIO_PIN = 18;
+    static constexpr int PWM_CLOCK = 19;
+    static constexpr int PWM_RANGE = 20000;
+    static constexpr int PWM_MIN = 1000;   // Minimum = 1000µs
+    static constexpr int PWM_MAX = 2000;   // Maximum = 2000µs
+    static constexpr int INIT_DELAY_SEC = 3;
+    
+    PumpControlNode() : Node("pump_controller_node"), shutdown_requested_(false)
+    {
+        // Initialize GPIO and Pump ESC
+        if (!initialize_pump_esc()) {
+            RCLCPP_ERROR(this->get_logger(), "Pump ESC initialization failed!");
+            return;
+        }
         
-        RCLCPP_INFO(this->get_logger(), "=== PUMP CONTROLLER STARTING ===");
+        // ROS2 subscribers
+        stop_subscriber_ = this->create_subscription<std_msgs::msg::Bool>(
+            "/peripherie/stop", 10,
+            std::bind(&PumpControlNode::stop_callback, this, std::placeholders::_1));
         
-        init_pwm();
-        RCLCPP_INFO(this->get_logger(), "PWM initialized successfully");
+        pwm_subscriber_ = this->create_subscription<std_msgs::msg::Float32>(
+            "/pump/pwm_command", 10,
+            std::bind(&PumpControlNode::pwm_callback, this, std::placeholders::_1));
         
-        speed_sub_ = this->create_subscription<std_msgs::msg::Float32>(
-            "/pump/speed_command", 10,
-            [this](const std_msgs::msg::Float32::SharedPtr msg) {
-                RCLCPP_INFO(this->get_logger(), "Speed command received: %.1f", msg->data);
-                set_speed((int)msg->data);
-            });
-            
-        stop_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-            "/spray/stop", 10,
-            [this](const std_msgs::msg::Bool::SharedPtr msg) {
-                RCLCPP_INFO(this->get_logger(), "Stop message received: %s", msg->data ? "true" : "false");
-                if (msg->data) {
-                    RCLCPP_INFO(this->get_logger(), "Stop signal received - shutting down pump");
-                    shutdown_pump();
-                    rclcpp::shutdown();
-                }
-            });
-            
-        RCLCPP_INFO(this->get_logger(), "Subscriptions created:");
-        RCLCPP_INFO(this->get_logger(), "  - /pump/speed_command");
-        RCLCPP_INFO(this->get_logger(), "  - /spray/stop");
-        RCLCPP_INFO(this->get_logger(), "=== PUMP CONTROLLER READY ===");
+        RCLCPP_INFO(this->get_logger(), "Pump control node initialized and ready");
     }
     
-    ~PumpController() {
-        shutdown_pump();
+    ~PumpControlNode()
+    {
+        cleanup();
     }
     
-    void shutdown_pump() {
-        RCLCPP_INFO(this->get_logger(), "Stopping pump...");
-        set_speed(1000);  // Neutral
-        usleep(500000);   // 500ms wait
-        pwmWrite(pwm_pin_, 0);  // PWM off
-        RCLCPP_INFO(this->get_logger(), "Pump stopped safely");
+    bool is_shutdown_requested() const
+    {
+        return shutdown_requested_;
     }
-
+    
 private:
-    void init_pwm() {
-        wiringPiSetupPinType(WPI_PIN_WPI);
+    bool initialize_pump_esc()
+    {
+        std::cout << "Initializing Pump ESC on GPIO " << GPIO_PIN << "..." << std::endl;
         
-        // Clean reset
-        pinMode(pwm_pin_, OUTPUT);
-        digitalWrite(pwm_pin_, LOW);
-        usleep(50000);
+        // Configure GPIO 18 as PWM
+        if (system("gpio -g mode 18 pwm") != 0) {
+            std::cerr << "Error: Failed to set GPIO mode for pump" << std::endl;
+            return false;
+        }
         
-        // PWM setup
-        pinMode(pwm_pin_, PWM_OUTPUT);
-        pwmWrite(pwm_pin_, 0);
-        usleep(10000);
+        system("gpio pwm-ms");
         
-        pwmSetMode(PWM_MODE_MS);
-        usleep(10000);
-        pwmSetClock(192);
-        usleep(10000);
-        pwmSetRange(2000);
-        usleep(10000);
+        char cmd[100];
+        sprintf(cmd, "gpio pwmc %d", PWM_CLOCK);
+        system(cmd);
         
-        set_speed(1000);  // Start neutral
+        sprintf(cmd, "gpio pwmr %d", PWM_RANGE);
+        system(cmd);
+        
+        // Send zero position (1000µs) for pump
+        std::cout << "Sending pump zero position (1000µs)..." << std::endl;
+        set_pwm_value(PWM_MIN);
+        
+        std::cout << "Waiting for pump ESC initialization..." << std::endl;
+        sleep(INIT_DELAY_SEC);
+        
+        std::cout << "Pump ESC ready!" << std::endl;
+        
+        return true;
     }
     
-    void set_speed(int us) {
-        if (us < 1000) us = 1000;
-        if (us > 2000) us = 2000;
-        pwmWrite(pwm_pin_, us / 10);
-        RCLCPP_DEBUG(this->get_logger(), "Speed set to: %d us", us);
+    void set_pwm_value(int pwm_value)
+    {
+        char cmd[100];
+        sprintf(cmd, "gpio -g pwm %d %d", GPIO_PIN, pwm_value);
+        system(cmd);
     }
     
-    int pwm_pin_;
-    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr speed_sub_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr stop_sub_;
+    void set_pump_pwm_absolute(double pwm_value_us)
+    {
+        // Clamp to valid range (1000-2000µs)
+        if (pwm_value_us < PWM_MIN) pwm_value_us = PWM_MIN;
+        if (pwm_value_us > PWM_MAX) pwm_value_us = PWM_MAX;
+        
+        int pwm_value = static_cast<int>(pwm_value_us);
+        
+        RCLCPP_DEBUG(this->get_logger(), "Setting pump to %dµs", pwm_value);
+        
+        set_pwm_value(pwm_value);
+    }
+    
+    void stop_callback(const std_msgs::msg::Bool::SharedPtr msg)
+    {
+        if (msg->data) {
+            RCLCPP_INFO(this->get_logger(), "Stop signal received → shutting down pump control node");
+            shutdown_requested_ = true;
+        }
+    }
+    
+    void pwm_callback(const std_msgs::msg::Float32::SharedPtr msg)
+    {
+        double pwm_value = static_cast<double>(msg->data);
+        set_pump_pwm_absolute(pwm_value);
+    }
+    
+    void cleanup()
+    {
+        std::cout << "Shutting down pump ESC safely..." << std::endl;
+        
+        // Set pump to minimum (1000µs) before exit
+        set_pwm_value(PWM_MIN);
+        sleep(1);
+        
+        std::cout << "Pump control node stopped" << std::endl;
+    }
+    
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr stop_subscriber_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr pwm_subscriber_;
+    std::atomic<bool> shutdown_requested_;
 };
 
-int main(int argc, char * argv[]) {
-    // Signal Handler VOR rclcpp::init
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    
+int main(int argc, char** argv)
+{
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<PumpController>());
-    rclcpp::shutdown();
+    
+    auto node = std::make_shared<PumpControlNode>();
+    
+    try {
+        while (rclcpp::ok() && !node->is_shutdown_requested()) {
+            rclcpp::spin_some(node);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Exception in pump control main loop: " << e.what() << std::endl;
+    }
+    
+    // Cleanup is handled in destructor
+    node.reset();
+    
+    if (rclcpp::ok()) {
+        rclcpp::shutdown();
+    }
+    
     return 0;
 }
